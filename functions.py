@@ -6,63 +6,27 @@ from scipy.optimize import minimize
 from tqdm.notebook import tqdm
 from scipy.interpolate import griddata
 from scipy.interpolate import interp1d
-
-def bs_call(S, K, T, r, vol):
-    d1 = (np.log(S/K) + (r + 0.5*vol**2)*T) / (vol*np.sqrt(T))
-    d2 = d1 - vol * np.sqrt(T)
-    return S * norm.cdf(d1) - np.exp(-r * T) * K * norm.cdf(d2)
+import bs_functions as bs
 
 
-def bs_put(S, K, T, r, vol):
-    d1 = (np.log(S/K) + (r + 0.5*vol**2)*T) / (vol*np.sqrt(T))
-    d2 = d1 - vol * np.sqrt(T)
-    return -S * norm.cdf(-d1) + np.exp(-r * T) * K * norm.cdf(-d2)
 
-
-def bs_vega(S, K, T, r, sigma):
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    return S * norm.pdf(d1) * np.sqrt(T)
-
-
-def bs_delta(S,K,T,r, q, sigma, call_put):
-    d1 = (np.log(S / K) + (r - q) * T) / (sigma * np.sqrt(T)) + 0.5 * sigma * np.sqrt(T)
-    return call_put*np.exp(-q*T) * norm.cdf( call_put * d1 )
-
-
-def implied_vol(target_value, S, K, r, T, call_put, *args):
-    max_iter = 500
-    tol = 1.0e-5
-    sigma = 0.5 #np.sqrt(2*np.pi/T * target_value / S) # brenner subrahmyan vol
-    for i in range(0, max_iter):
-        if call_put == 1:
-            price = bs_call(S, K, T, r, sigma)
-        else:
-            price = bs_put(S, K, T, r, sigma)
-        vega = bs_vega(S, K, T, r, sigma)
-        diff = target_value - price  # our root
-        if (abs(diff) < tol):
-            return sigma
-        sigma = sigma + diff/vega # https://quant.stackexchange.com/questions/7761/a-simple-formula-for-calculating-implied-volatility
-    return sigma
 
 
 def parametrisation( p, x, y, w ):
     return np.sum( w * (y - p[0] * x - p[1] * x**2 - p[2] )**2 )
 
 
-def delta_obj(p, params ):
+def delta_obj( p, params ):
     d, q, T, a, b, c, call_put = params
     return -call_put*p/(np.sqrt(a*p+b*p**2+c))+call_put*0.5*np.sqrt(a*p+b*p**2+c) - norm.ppf( d / (call_put*np.exp(-q*T)) )
 
-
 def vol_obj( p, params ):
-    pri, S, K, r, T, call_put = params
+    pri, S, K, r, q, T, call_put = params
 
-    d1 = (np.log(S/K) + (r + 0.5*p**2)*T) / (p*np.sqrt(T))
+    d1 = (np.log(S/K) + (r - q + 0.5*p**2)*T) / (p*np.sqrt(T))
     d2 = d1 - p * np.sqrt(T)
 
-    return call_put * (S * norm.cdf(call_put*d1) - np.exp(-r * T) * K * norm.cdf(call_put*d2)) - pri
-
+    return call_put * (S * np.exp(-q*T) * norm.cdf(call_put*d1) - np.exp(-r * T) * K * norm.cdf(call_put*d2)) - pri
 
 def solve_obj(obj, bounds, params, tol = 1e-5, verbose = True):
     lower_bound, upper_bound = bounds
@@ -86,20 +50,32 @@ def solve_obj(obj, bounds, params, tol = 1e-5, verbose = True):
             return np.nan
     return i
 
+def implied_vol(target_value, S, K, r, q, T, call_put, *args):
+    max_iter = 500
+    tol = 1.0e-5
+    sigma = 0.5 #np.sqrt(2*np.pi/T * target_value / S) # brenner subrahmyan vol
+    for i in range(0, max_iter):
+        price = bs.bs_value(S, K, T, r, q, sigma, call_put)
+        vega = bs.bs_vega(S, K, T, r, q, sigma)
+        diff = target_value - price  # our root
+        if (abs(diff) < tol):
+            return sigma
+        sigma = sigma + diff/vega # https://quant.stackexchange.com/questions/7761/a-simple-formula-for-calculating-implied-volatility
+    return sigma
 
-
-def calc_iv( opts, underlying, call_put ):
+def calc_iv( opts, underlying, call_put, rate = 0, div = 0 ):
     ivs = []
     temp = opts.copy()
     for idx in tqdm(temp.index):
         target_value = temp.price.loc[idx]
         K = temp.strike.loc[idx]
         S = underlying.close[-1]
-        r = 0.0
+        r = rate
+        q = div
         T = temp.time_to_expiration.loc[idx]
         bounds = (0,100)
-        params = (target_value, S, K, r, T, call_put)
-        x = implied_vol( target_value, S, K, r, T, call_put )
+        params = (target_value, S, K, r, q, T, call_put)
+        x = implied_vol( target_value, S, K, r, q, T, call_put )
         if x != x:
             x = solve_obj( vol_obj, bounds, params )
             if x != x:
@@ -108,22 +84,23 @@ def calc_iv( opts, underlying, call_put ):
     return ivs
 
 
-def calc_delta(opts, underlying, call_put):
+def calc_delta(opts, underlying, call_put, rate = 0, div = 0):
     opts['delta'] = np.nan
 
     for idx in opts.index:
         call_put = 1
         K = opts.strike.loc[idx]
         S = underlying.close[-1]
-        r = 0.0
-        q = 0.0
+        r = rate
+        q = div
         T = opts.time_to_expiration.loc[idx]
         sigma = opts.implied_volatility.loc[idx]
-        opts.loc[idx, 'delta'] = bs_delta(S, K, T, r, q, sigma, call_put)
+        opts.loc[idx, 'delta'] = bs.bs_delta(S, K, T, r, q, sigma, call_put)
     return opts
 
 
 def delta_surface(options, call_put_options, underlying, call_put, verbose = False ):
+    # underlying should be the forward price
     parameters = {}
     delta_ivs = {}
     expirations = np.unique(call_put_options.expiration)
@@ -190,6 +167,7 @@ def create_surface(X,Y,Z, method):
    XX,YY = np.meshgrid(np.linspace(min(X),max(X), len(X) ),np.linspace(min(Y),max(Y),len(Y) ))
    ZZ = griddata(np.array([X,Y]).T,np.array(Z),(XX,YY), method=method ) # fill_value = np.median(Z)
    return XX,YY,ZZ
+
 
 def standardise_expiration(df, standard_exp):
     temp = pd.Series( df.columns.values - standard_exp )
